@@ -7,10 +7,11 @@ import { after, test } from "node:test";
 import { App } from "../dist/app.js";
 import { DEFAULT_UI, loadConfig, PROJECT_CONFIG } from "../dist/config.js";
 import { runHook } from "../dist/hooks.js";
+import { CUSTOM_ENGINES } from "../dist/engines.js";
 import { Keymap } from "../dist/keys.js";
 import { Session } from "../dist/session.js";
 import { BUILTIN_THEMES, Painter } from "../dist/theme.js";
-import { isTrusted, trustFile } from "../dist/trust.js";
+import { executeProjectTrust, isTrusted, trustFile } from "../dist/trust.js";
 import { Tty } from "./support/terminal.mjs";
 
 const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "vigent-project-")));
@@ -175,24 +176,121 @@ test("agent_finished runs whenever an agent stops, with VIGENT_STATE", async () 
 	);
 });
 
-test(":trust asks the CLI to trust the project's file", () => {
-	const { app } = makeApp();
-	app.trustProject = () => "trusted .vigent.toml: hooks.before_merge now run";
-	[":", ..."trust", "\r"].forEach((k) => app.handleInput(k));
-	assert.match(app.message, /trusted \.vigent\.toml: hooks\.before_merge now run/);
+test("untrusted configuration remains gated until trust approval", () => {
+	const f = write(
+		"untrusted-repo/.vigent.toml",
+		`[engines.claude]\nallow = ["Bash(gh:*)"]\nargs = ["--dangerously-skip-permissions"]\n` +
+		`[engines.evil_runner]\ncommand = ["sh", "-c", "echo evil"]\n`
+	);
+	const text = fs.readFileSync(f, "utf8");
+	assert.equal(isTrusted(f, text), false);
+	const { config, gated } = loadConfig(f, { trusted: false, label: PROJECT_CONFIG });
+	assert.deepEqual(gated.sort(), ["engines.claude.allow", "engines.claude.args", "engines.evil_runner.command"].sort());
+	assert.equal(config.engines.claude.allow, undefined);
+	assert.equal(config.engines.claude.args, undefined);
+	assert.equal(CUSTOM_ENGINES.has("evil_runner"), false);
 });
 
-test("the real vigent: warns about an untrusted .vigent.toml, :trust makes its hooks run, vigent trust works too", { timeout: 60000 }, async () => {
+test("trust synchronizes engine permissions, args, model defaults, and custom engines without affecting active sessions", async () => {
+	const projectFile = write(
+		"sync-repo/.vigent.toml",
+		`[engines.claude]\nallow = ["Bash(gh:*)", "Bash(cargo:*)"]\nargs = ["--permission-mode", "bypassPermissions"]\nmodel = "claude-project-model"\n` +
+		`[engines.opencode]\nmodel = "anthropic/claude-sonnet-4-5"\neffort = "high"\n` +
+		`[engines.tool_engine]\ncommand = ["echo", "{prompt}"]\nmodels = ["fast-tool"]\n`
+	);
+
+	const { app } = makeApp();
+	const config = loadConfig(write("sync-home/config.toml", "")).config;
+
+	// User explicitly picked an in-session model preference before trust
+	app.newAgentModel.claude = "user-explicit-opus";
+
+	// Create an existing active session with its own model, effort, and conversation
+	const s = app.startAgent("active-worker");
+	s.model = "session-haiku";
+	s.effort = "high";
+	s.pushUser("initial task");
+	s.allow = () => config.engines.claude?.allow;
+	s.extraArgs = () => config.engines.claude?.args;
+
+	// Initial untrusted state checks
+	assert.equal(isTrusted(projectFile, fs.readFileSync(projectFile, "utf8")), false);
+	assert.equal(CUSTOM_ENGINES.has("tool_engine"), false);
+	assert.equal(s.allow(), undefined, "untrusted allow rule must not reach session invocation");
+	assert.equal(s.extraArgs(), undefined, "untrusted args must not reach session invocation");
+
+	// Wire real executeProjectTrust to app.trustProject and run :trust
+	app.trustProject = () => executeProjectTrust({ app, config, projectFile });
+	[":", ..."trust", "\r"].forEach((k) => app.handleInput(k));
+
+	// Verification 1: Trust confirmed and persisted
+	assert.match(app.message, /trusted \.vigent\.toml: .*engines\.tool_engine\.command.*now run/);
+	assert.match(app.message, /engines\.claude\.allow/);
+	assert.match(app.message, /engines\.claude\.args/);
+	assert.equal(isTrusted(projectFile, fs.readFileSync(projectFile, "utf8")), true);
+
+	// Verification 2: Engine options and permissions are refreshed
+	assert.deepEqual(app.engineOptions.claude.allow, ["Bash(gh:*)", "Bash(cargo:*)"]);
+	assert.deepEqual(app.engineOptions.claude.args, ["--permission-mode", "bypassPermissions"]);
+
+	// Verification 3: Dynamic permissions reach the running session on next turn
+	assert.deepEqual(s.allow(), ["Bash(gh:*)", "Bash(cargo:*)"]);
+	assert.deepEqual(s.extraArgs(), ["--permission-mode", "bypassPermissions"]);
+
+	// Verification 4: Existing session remains completely untouched
+	assert.equal(s.name, "active-worker");
+	assert.equal(s.model, "session-haiku", "active session model must not be changed");
+	assert.equal(s.effort, "high", "active session effort must not be changed");
+	assert.equal(s.items.length, 1);
+	assert.equal(s.items[0].text, "initial task");
+
+	// Verification 5: Explicit user in-session model selection survives
+	assert.equal(app.newAgentModel.claude, "user-explicit-opus", "user's explicit model choice must not be clobbered");
+
+	// Verification 6: Project defaults apply to engines that had no prior selection
+	assert.equal(app.newAgentModel.opencode, "anthropic/claude-sonnet-4-5");
+	assert.equal(app.newAgentEffort.opencode, "high");
+	assert.equal(app.newAgentModel.tool_engine, "fast-tool");
+
+	// Verification 7: Newly trusted custom engines are registered and appear in app.engines
+	assert.equal(CUSTOM_ENGINES.has("tool_engine"), true);
+	assert.ok(app.engines.some((e) => e.id === "tool_engine"), "custom engine shows up in app.engines immediately");
+
+	// Verification 8: Repeated trust execution is idempotent and safe
+	[":", ..."trust", "\r"].forEach((k) => app.handleInput(k));
+	assert.equal(app.engines.filter((e) => e.id === "tool_engine").length, 1, "no duplicate engine entries on re-trust");
+	assert.deepEqual(app.engineOptions.claude.allow, ["Bash(gh:*)", "Bash(cargo:*)"]);
+});
+
+test("trust rejects unreadable or malformed files without corrupting state", () => {
+	const { app } = makeApp();
+	const config = loadConfig(write("bad-home/config.toml", "")).config;
+	app.engineOptions = config.engines;
+
+	// Missing file
+	const missing = path.join(tmp, "does-not-exist", ".vigent.toml");
+	const resMissing = executeProjectTrust({ app, config, projectFile: missing });
+	assert.equal(resMissing, `no ${PROJECT_CONFIG} in this project`);
+
+	// Malformed syntax
+	const brokenFile = write("broken-repo/.vigent.toml", `[engines.claude\nbad = `);
+	const resBroken = executeProjectTrust({ app, config, projectFile: brokenFile });
+	assert.match(resBroken, /can't trust \.vigent\.toml:/);
+	assert.equal(isTrusted(brokenFile, fs.readFileSync(brokenFile, "utf8")), false, "broken file must not be marked trusted");
+	assert.deepEqual(app.engineOptions, config.engines, "state must not be corrupted");
+});
+
+test("the real vigent: warns about an untrusted .vigent.toml, :trust makes its hooks and permissions run, vigent trust works too", { timeout: 60000 }, async () => {
 	const repo = path.join(tmp, "shop");
 	fs.mkdirSync(repo);
 	execFileSync("git", ["init", "-q"], { cwd: repo });
-	fs.writeFileSync(path.join(repo, ".vigent.toml"), `theme = "gruvbox"\n[hooks]\nworktree_created = "touch .setup-ran"\n`);
+	fs.writeFileSync(path.join(repo, ".vigent.toml"), `theme = "gruvbox"\n[engines.claude]\nallow = ["Bash(gh:*)"]\n[hooks]\nworktree_created = "touch .setup-ran"\n`);
 	const env = { ...process.env, XDG_STATE_HOME: path.join(tmp, "state-e2e"), XDG_CONFIG_HOME: path.join(tmp, "cfg-e2e"), TERM: "xterm-256color" };
 	const t = new Tty(["--demo"], { cwd: repo, env, cols: 140, rows: 30 });
 	try {
-		await t.waitFor(/\.vigent\.toml wants to run commands \(hooks\.worktree_created\): :trust allows them/);
+		await t.waitFor(/\.vigent\.toml wants to run commands \(engines\.claude\.allow, hooks\.worktree_created\): :trust allows them/);
 		await t.type(":trust\r");
-		await t.waitFor(/trusted \.vigent\.toml: hooks\.worktree_created now run/);
+		await t.waitFor(/trusted \.vigent\.toml: engines\.claude\.allow, hooks\.worktree_created now run/);
 	} finally {
 		t.kill();
 	}
@@ -201,5 +299,5 @@ test("the real vigent: warns about an untrusted .vigent.toml, :trust makes its h
 
 	// the CLI way, from a fresh state
 	const out = execFileSync(process.execPath, [path.join(import.meta.dirname, "..", "dist", "cli.js"), "trust"], { cwd: repo, env: { ...env, XDG_STATE_HOME: path.join(tmp, "state-cli") }, encoding: "utf8" });
-	assert.match(out, /trusted .*\.vigent\.toml: hooks\.worktree_created will run/);
+	assert.match(out, /trusted .*\.vigent\.toml: engines\.claude\.allow, hooks\.worktree_created will run/);
 });

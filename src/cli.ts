@@ -12,7 +12,7 @@ import { staleBuild, VERSION_TEXT } from "./version.js";
 import { CliSession } from "./cli-engines.js";
 import { CUSTOM_ENGINES, defaultEngine, detectEngines, ENGINE_BINS, ENGINE_NAMES, type EngineId, isEngineId, onPath, piConnected, quickEngines, engineEnv } from "./engines.js";
 import { CONFIG_TEMPLATE, configPath, loadConfig, PROJECT_CONFIG } from "./config.js";
-import { isTrusted, trustFile } from "./trust.js";
+import { executeProjectTrust, isTrusted, trustFile } from "./trust.js";
 import { setTomlValue } from "./config-edit.js";
 import { createDemoSessions } from "./demo.js";
 import { buildKeymap, KEY_MODES } from "./keys.js";
@@ -422,18 +422,13 @@ async function main(): Promise<number | undefined> {
 	app.styleConfig = config.style;
 	app.commands = config.commands;
 	// :trust: let this project's .vigent.toml run its commands, from now on
-	app.trustProject = () => {
-		if (!projectFile || !fs.existsSync(projectFile)) return `no ${PROJECT_CONFIG} in this project`;
-		const content = fs.readFileSync(projectFile, "utf8");
-		trustFile(projectFile, content);
-		const { gated } = loadConfig(projectFile, { trusted: false, label: PROJECT_CONFIG });
-		loadConfig(projectFile, { base: config, trusted: true, label: PROJECT_CONFIG });
-		app.hooks = config.hooks;
-		app.layout = config.layout;
-		app.styleConfig = config.style;
-		app.commands = config.commands;
-		return `trusted ${PROJECT_CONFIG}${gated.length ? `: ${gated.join(", ")} now run` : ""}`;
-	};
+	app.trustProject = () =>
+		executeProjectTrust({
+			app,
+			config,
+			projectFile,
+			reloadPermissions: savedPermissions,
+		});
 	for (const [id, opts] of Object.entries(config.engines)) {
 		if (opts?.model) app.newAgentModel[id as EngineId] = opts.model;
 		if (opts?.effort) app.newAgentEffort[id as EngineId] = opts.effort;
