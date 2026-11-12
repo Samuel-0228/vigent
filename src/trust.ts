@@ -14,7 +14,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { App } from "./app.js";
 import { type Config, loadConfig, PROJECT_CONFIG } from "./config.js";
-import { CUSTOM_ENGINES, type EngineId, quickEngines } from "./engines.js";
+import { type EngineId, quickEngines } from "./engines.js";
+import { parse as parseToml } from "smol-toml";
 
 function stateFile(): string {
 	const xdg = process.env.XDG_STATE_HOME;
@@ -74,11 +75,14 @@ export function executeProjectTrust(ctx: TrustSyncContext): string {
 		return `can't read ${PROJECT_CONFIG}: ${(err as Error).message}`;
 	}
 
-	const { gated, warnings } = loadConfig(projectFile, { trusted: false, label: PROJECT_CONFIG });
-	const syntaxErr = warnings.find((w) => w.startsWith(`${path.basename(projectFile)}:`));
-	if (syntaxErr) {
-		return `can't trust ${PROJECT_CONFIG}: ${syntaxErr}`;
+	// Only a file that doesn't parse is refused. Other warnings, like an unknown key, start with
+	// the same `.vigent.toml:` prefix but never stopped a file from being trusted.
+	try {
+		parseToml(content);
+	} catch (err) {
+		return `can't trust ${PROJECT_CONFIG}: ${(err as Error).message.split("\n")[0]}`;
 	}
+	const { gated } = loadConfig(projectFile, { trusted: false, label: PROJECT_CONFIG });
 
 	trustFile(projectFile, content);
 	loadConfig(projectFile, { base: config, trusted: true, label: PROJECT_CONFIG });
@@ -100,11 +104,6 @@ export function executeProjectTrust(ctx: TrustSyncContext): string {
 		}
 		if (opts?.effort && !app.newAgentEffort[id as EngineId]) {
 			app.newAgentEffort[id as EngineId] = opts.effort;
-		}
-	}
-	for (const [id, custom] of CUSTOM_ENGINES.entries()) {
-		if (custom.models?.length && !app.newAgentModel[id as EngineId]) {
-			app.newAgentModel[id as EngineId] = custom.models[0];
 		}
 	}
 

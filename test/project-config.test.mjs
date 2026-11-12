@@ -250,7 +250,7 @@ test("trust synchronizes engine permissions, args, model defaults, and custom en
 	// Verification 6: Project defaults apply to engines that had no prior selection
 	assert.equal(app.newAgentModel.opencode, "anthropic/claude-sonnet-4-5");
 	assert.equal(app.newAgentEffort.opencode, "high");
-	assert.equal(app.newAgentModel.tool_engine, "fast-tool");
+	assert.equal(app.newAgentModel.tool_engine, undefined, "a custom engine starts on its own default, as it does after a restart");
 
 	// Verification 7: Newly trusted custom engines are registered and appear in app.engines
 	assert.equal(CUSTOM_ENGINES.has("tool_engine"), true);
@@ -260,6 +260,16 @@ test("trust synchronizes engine permissions, args, model defaults, and custom en
 	[":", ..."trust", "\r"].forEach((k) => app.handleInput(k));
 	assert.equal(app.engines.filter((e) => e.id === "tool_engine").length, 1, "no duplicate engine entries on re-trust");
 	assert.deepEqual(app.engineOptions.claude.allow, ["Bash(gh:*)", "Bash(cargo:*)"]);
+});
+
+test("a project file with an unknown key can still be trusted; the key stays a warning", () => {
+	const { app } = makeApp();
+	const config = loadConfig(write("typo-home/config.toml", "")).config;
+	const projectFile = write("typo-repo/.vigent.toml", `colour = "gruvbox"\n[hooks]\nworktree_created = "npm ci"\n`);
+	assert.match(loadConfig(projectFile, { trusted: false, label: PROJECT_CONFIG }).warnings.join("\n"), /^\.vigent\.toml: unknown key 'colour'/);
+	assert.equal(executeProjectTrust({ app, config, projectFile }), "trusted .vigent.toml: hooks.worktree_created now run");
+	assert.equal(isTrusted(projectFile, fs.readFileSync(projectFile, "utf8")), true);
+	assert.equal(app.hooks.worktree_created, "npm ci");
 });
 
 test("trust rejects unreadable or malformed files without corrupting state", () => {
